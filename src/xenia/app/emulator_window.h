@@ -10,6 +10,7 @@
 #ifndef XENIA_APP_EMULATOR_WINDOW_H_
 #define XENIA_APP_EMULATOR_WINDOW_H_
 
+#include <array>
 #include <memory>
 #include <string>
 
@@ -202,6 +203,24 @@ class EmulatorWindow {
         installation_entries_;
   };
 
+  class NativeContentDialog final : public ui::ImGuiDialog {
+   public:
+    NativeContentDialog(ui::ImGuiDrawer* imgui_drawer,
+                        EmulatorWindow& emulator_window,
+                        std::filesystem::path working_directory);
+
+   protected:
+    void OnDraw(ImGuiIO& io) override;
+
+   private:
+    uint64_t window_id_ = 0;
+    EmulatorWindow& emulator_window_;
+    std::filesystem::path working_directory_;
+    std::array<char, 256> display_name_ = {};
+    std::array<char, 1024> command_ = {};
+    std::string status_message_;
+  };
+
   class DisplayConfigDialog final : public ui::ImGuiDialog {
    public:
     DisplayConfigDialog(ui::ImGuiDrawer* imgui_drawer,
@@ -265,6 +284,7 @@ class EmulatorWindow {
   void FileOpen();
   void FileClose();
   void InstallContent();
+  void AddNativeContent();
   void ExtractZarchive();
   void CreateZarchive();
   void ShowContentDirectory();

@@ -7,10 +7,17 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <filesystem>
+#include <string>
+#include <system_error>
+
+#include "xenia/emulator.h"
 #include "xenia/base/clock.h"
 #include "xenia/base/cvar.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string_util.h"
+#include "xenia/base/utf8.h"
 #include "xenia/config.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/title_id_utils.h"
@@ -171,22 +178,26 @@ dword_result_t XamGetCachedTitleName_entry(dword_t title_id,
     return X_ERROR_INVALID_PARAMETER;
   }
 
-  assert_false(title_id != kernel_state()->title_id());
-
   char16_t* title_name_ptr =
       kernel_state()->memory()->TranslateVirtual<char16_t*>(title_name_address);
 
-  std::u16string title_name = xe::to_utf16(
-      kernel_state()->emulator()->game_info_database()->GetTitleName());
+  auto* emulator = kernel_state()->emulator();
+  const auto* game_info = emulator->game_info_database();
+  const std::string resolved_title_name =
+      game_info ? game_info->GetTitleName() : emulator->title_name();
+  std::u16string title_name = xe::to_utf16(resolved_title_name);
 
-  size_t title_name_size = string_util::size_in_bytes(title_name, true);
-
-  string_util::copy_and_swap_truncating(title_name_ptr, title_name,
-                                        title_name_size);
-
+  const uint32_t capacity_bytes = *title_name_size_ptr;
+  const size_t title_name_size = string_util::size_in_bytes(title_name, true);
   *title_name_size_ptr = static_cast<uint32_t>(title_name_size);
+  if (capacity_bytes < sizeof(char16_t)) {
+    return X_ERROR_INSUFFICIENT_BUFFER;
+  }
 
-  return X_ERROR_SUCCESS;
+  string_util::copy_and_swap_truncating(
+      title_name_ptr, title_name, capacity_bytes / sizeof(char16_t));
+  return capacity_bytes >= title_name_size ? X_ERROR_SUCCESS
+                                           : X_ERROR_INSUFFICIENT_BUFFER;
 }
 DECLARE_XAM_EXPORT1(XamGetCachedTitleName, kNone, kImplemented);
 
@@ -221,6 +232,35 @@ dword_result_t XamGetCurrentTitleId_entry() {
   return kernel_state()->emulator()->title_id();
 }
 DECLARE_XAM_EXPORT1(XamGetCurrentTitleId, kNone, kImplemented);
+
+// xam!8169CFC8 returns the saved prior title only while loader state == 5.
+// A cold dashboard boot has no prior title and therefore returns zero.
+dword_result_t XamLoaderGetPriorTitleId_entry() {
+  constexpr uint32_t kNoPriorTitle = 0;
+  XELOGI("XamLoaderGetPriorTitleId() -> {:08X}", kNoPriorTitle);
+  return kNoPriorTitle;
+}
+DECLARE_XAM_EXPORT1(XamLoaderGetPriorTitleId, kNone, kImplemented);
+
+// xam!81994C40 always writes the two stored demand DWORDs when their output
+// pointers are supplied, and returns TRUE only when the demand ID is nonzero.
+dword_result_t XamGetCurrentDemand_entry(lpdword_t demand_type,
+                                         lpdword_t demand_id) {
+  const auto xam_state = kernel_state()->xam_state();
+  if (demand_type) {
+    *demand_type = xam_state->current_demand_type_;
+  }
+  if (demand_id) {
+    *demand_id = xam_state->current_demand_id_;
+  }
+
+  const bool active = xam_state->current_demand_id_ != 0;
+  XELOGI("XamGetCurrentDemand(type={:08X}, id={:08X}) -> {}",
+         xam_state->current_demand_type_, xam_state->current_demand_id_,
+         active);
+  return active;
+}
+DECLARE_XAM_EXPORT1(XamGetCurrentDemand, kNone, kImplemented);
 
 dword_result_t XamIsCurrentTitleDash_entry(const ppc_context_t& ctx) {
   return ctx->kernel_state->title_id() == kDashboardID;
@@ -281,65 +321,120 @@ dword_result_t XamLoaderGetLaunchData_entry(lpvoid_t buffer_ptr,
   uint32_t copy_size =
       std::min(uint32_t(loader_data.launch_data.size()), uint32_t(buffer_size));
   std::memcpy(buffer_ptr, loader_data.launch_data.data(), copy_size);
+  if (loader_data.launch_data.size() == 0x3FC && copy_size >= 0x0C) {
+    const uint32_t state =
+        xe::load_and_swap<uint32_t>(loader_data.launch_data.data() + 4);
+    const uint32_t user =
+        xe::load_and_swap<uint32_t>(loader_data.launch_data.data() + 8);
+    XELOGI("XamLoaderGetLaunchData: state={} user={} size={}", state, user,
+           copy_size);
+  }
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamLoaderGetLaunchData, kNone, kSketchy);
 
+namespace {
+
+std::filesystem::path GetLoaderHostPath(XamModule* xam,
+                                        std::string_view root_name) {
+  if (!root_name.empty()) {
+    std::string normalized_root(root_name);
+    std::replace(normalized_root.begin(), normalized_root.end(), '\\', '/');
+    const std::string lower_root = xe::utf8::lower_ascii(normalized_root);
+    if (!lower_root.starts_with("xsyslaunch:/") &&
+        !lower_root.starts_with("game:/") &&
+        !lower_root.starts_with("d:/")) {
+      const std::filesystem::path direct_host_path = xe::to_path(root_name);
+      std::error_code ec;
+      if (std::filesystem::exists(direct_host_path, ec) && !ec) {
+        return direct_host_path;
+      }
+    }
+  }
+  return xe::to_path(xam->loader_data().host_path);
+}
+
+}  // namespace
+
 void XamLoaderLaunchTitle_entry(lpstring_t raw_name_ptr, dword_t flags) {
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  const std::string launch_path =
+      raw_name_ptr ? raw_name_ptr.value() : std::string();
 
-  auto& loader_data = xam->loader_data();
-  loader_data.launch_flags = flags;
-
-  std::string title;
-  std::string message;
-
-  // Translate the launch path to a full path.
-  if (raw_name_ptr && !raw_name_ptr.value().empty()) {
-    loader_data.launch_path = xe::path_to_utf8(raw_name_ptr.value());
-    xam->SaveLoaderData();
-    title = "Title was restarted";
-    message =
-        "Title closed with new launch data. \nPlease restart Xenia. "
-        "Game will be loaded automatically.";
-  } else {
-    title = "Title terminated";
-    message = "Game requested exit to dashboard.";
-    assert_always("Game requested exit to dashboard via XamLoaderLaunchTitle");
+  if (launch_path.empty()) {
+    XELOGI("XamLoaderLaunchTitle: returning to dashboard, flags={:08X}.",
+           flags.value());
+    xam->RequestDashboardLaunch(flags);
+    return;
   }
 
-  auto display_window = kernel_state()->emulator()->display_window();
-  auto imgui_drawer = kernel_state()->emulator()->imgui_drawer();
-
-  if (display_window && imgui_drawer) {
-    display_window->app_context().CallInUIThreadSynchronous(
-        [imgui_drawer, title, message]() {
-          auto dialog = xe::ui::ImGuiDialog::ShowMessageBox(
-              imgui_drawer, title.c_str(), message.c_str());
-
-          std::jthread([dialog]() {
-            while (!dialog->IsClosing()) {
-              std::this_thread::yield();
-            }
-
-            config::SaveConfig();
-            xe::FlushLog();
-
-            std::quick_exit(0);
-          }).detach();
-        });
-  }
-
-  // This function does not return.
-  kernel_state()->TerminateTitle();
+  const std::filesystem::path host_path = GetLoaderHostPath(xam, {});
+  XELOGI("XamLoaderLaunchTitle: host='{}', guest='{}', flags={:08X}.",
+         host_path, launch_path, flags.value());
+  xam->RequestTitleLaunch(host_path, launch_path, flags);
 }
-DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kSketchy);
+DECLARE_XAM_EXPORT1(XamLoaderLaunchTitle, kNone, kImplemented);
+
+// Retail 17559 calls this with four arguments: root namespace, XEX path,
+// optional launch data/context and launch flags. Content launch APIs populate
+// XamModule::loader_data().host_path before using the XSYSLAUNCH namespace.
+void XamLoaderLaunchTitleEx_entry(lpstring_t root_name_ptr,
+                                  lpstring_t xex_name_ptr,
+                                  lpvoid_t launch_context, dword_t flags) {
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  const std::string root_name =
+      root_name_ptr ? root_name_ptr.value() : std::string();
+  const std::string xex_name =
+      xex_name_ptr ? xex_name_ptr.value() : std::string();
+
+  XELOGI(
+      "XamLoaderLaunchTitleEx(root='{}', xex='{}', context={:08X}, "
+      "flags={:08X}).",
+      root_name, xex_name, launch_context.guest_address(), flags.value());
+
+  if (root_name.empty() && xex_name.empty()) {
+    xam->RequestDashboardLaunch(flags);
+    return;
+  }
+
+  const std::filesystem::path host_path =
+      GetLoaderHostPath(xam, root_name);
+  if (host_path.empty()) {
+    XELOGE("XamLoaderLaunchTitleEx: no host title path is available.");
+    return;
+  }
+  xam->RequestTitleLaunch(host_path, xex_name, flags);
+}
+DECLARE_XAM_EXPORT1(XamLoaderLaunchTitleEx, kNone, kImplemented);
+
+void XamLoaderLaunchTitleForReason_entry(dword_t reason) {
+  XELOGI("XamLoaderLaunchTitleForReason(reason={:08X}).", reason.value());
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->RequestDashboardLaunch(reason);
+}
+DECLARE_XAM_EXPORT1(XamLoaderLaunchTitleForReason, kNone, kImplemented);
+
+void XamLoaderRebootToDash_entry(lpvoid_t launch_context) {
+  XELOGI("XamLoaderRebootToDash(context={:08X}).",
+         launch_context.guest_address());
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->RequestDashboardLaunch();
+}
+DECLARE_XAM_EXPORT1(XamLoaderRebootToDash, kNone, kImplemented);
+
+void XamLoaderRebootToServerDash_entry() {
+  XELOGI("XamLoaderRebootToServerDash().");
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->RequestDashboardLaunch();
+}
+DECLARE_XAM_EXPORT1(XamLoaderRebootToServerDash, kNone, kImplemented);
 
 void XamLoaderTerminateTitle_entry() {
-  // This function does not return.
-  kernel_state()->TerminateTitle();
+  XELOGI("XamLoaderTerminateTitle: returning to dashboard.");
+  auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
+  xam->RequestDashboardLaunch();
 }
-DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kSketchy);
+DECLARE_XAM_EXPORT1(XamLoaderTerminateTitle, kNone, kImplemented);
 
 uint32_t XamAllocImpl(uint32_t flags, uint32_t size,
                       xe::be<uint32_t>* out_ptr) {
@@ -717,6 +812,110 @@ void XamGetActiveDashAppInfo_entry(pointer_t<X_DASH_APP_INFO> dash_app) {
               sizeof(X_DASH_APP_INFO));
 }
 DECLARE_XAM_EXPORT1(XamGetActiveDashAppInfo, kNone, kImplemented);
+
+namespace {
+
+struct X_LAUNCH_URI_MESSAGE {
+  xe::be<uint32_t> flags;
+  xe::be<uint32_t> user_index;
+  char uri[0x3FC];
+};
+static_assert_size(X_LAUNCH_URI_MESSAGE, 0x404);
+
+X_HRESULT DispatchLaunchUri(uint32_t user_index, const std::string& uri,
+                            uint32_t flags,
+                            pointer_t<XAM_OVERLAPPED> overlapped) {
+  if (uri.empty() || uri.size() + 1 > sizeof(X_LAUNCH_URI_MESSAGE::uri)) {
+    return X_E_INVALIDARG;
+  }
+
+  auto memory = kernel_state()->memory();
+  const uint32_t message_guest =
+      memory->SystemHeapAlloc(sizeof(X_LAUNCH_URI_MESSAGE));
+  if (!message_guest) {
+    return X_HRESULT_FROM_WIN32(X_ERROR_NOT_ENOUGH_MEMORY);
+  }
+
+  auto message =
+      memory->TranslateVirtual<X_LAUNCH_URI_MESSAGE*>(message_guest);
+  std::memset(message, 0, sizeof(*message));
+  message->flags = flags;
+  message->user_index = user_index;
+  std::memcpy(message->uri, uri.c_str(), uri.size() + 1);
+
+  // Retail XamLaunchURI 17559 dispatches app FE, message 22003, with this
+  // exact 0x404-byte structure through XMsgStartIORequestEx.
+  X_HRESULT result = kernel_state()->app_manager()->DispatchMessageAsync(
+      0xFE, 0x00022003, message_guest, sizeof(X_LAUNCH_URI_MESSAGE));
+  memory->SystemHeapFree(message_guest);
+
+  if (overlapped) {
+    kernel_state()->CompleteOverlappedImmediate(overlapped.guest_address(),
+                                                result);
+    // Retail xam!8199FBC8 returns HRESULT 0x8000000A here. The dashboard
+    // explicitly compares against this value before waiting for the
+    // overlapped result; Win32 ERROR_IO_PENDING (997) is not accepted.
+    return 0x8000000Au;
+  }
+  return result;
+}
+
+}  // namespace
+
+dword_result_t XamLoaderRegisterLaunchRequestCallback_entry(
+    lpvoid_t callback) {
+  kernel_state()->xam_state()->dash_launch_request_callback_ =
+      callback.guest_address();
+  XELOGI("XamLoaderRegisterLaunchRequestCallback({:08X})",
+         callback.guest_address());
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamLoaderRegisterLaunchRequestCallback, kNone,
+                    kImplemented);
+
+dword_result_t XamLaunchURI_entry(dword_t user_index, lpstring_t uri,
+                                  dword_t flags,
+                                  pointer_t<XAM_OVERLAPPED> overlapped) {
+  if (!uri) {
+    return X_E_INVALIDARG;
+  }
+
+  const std::string uri_value(uri.value());
+  XELOGI("XamLaunchURI(user={}, uri='{}', flags={:08X}, overlapped={:08X})",
+         static_cast<uint32_t>(user_index), uri_value,
+         static_cast<uint32_t>(flags), overlapped.guest_address());
+  return DispatchLaunchUri(user_index, uri_value, flags, overlapped);
+}
+DECLARE_XAM_EXPORT1(XamLaunchURI, kNone, kImplemented);
+
+dword_result_t XamPushBackURI_entry(lpstring_t uri) {
+  auto state = kernel_state()->xam_state();
+  if (!uri) {
+    state->dash_back_uri_.clear();
+    state->dash_back_uri_state_ = 0;
+    XELOGI("XamPushBackURI(NULL): cleared");
+    return X_ERROR_SUCCESS;
+  }
+
+  const std::string uri_value(uri.value());
+  if (uri_value.size() + 1 > 0x3FC) {
+    return X_HRESULT_FROM_WIN32(X_ERROR_INSUFFICIENT_BUFFER);
+  }
+
+  state->dash_back_uri_ = uri_value;
+  const uint32_t title_id = kernel_state()->title_id();
+  state->dash_back_uri_state_ =
+      (title_id & 0xFFFE0000u) == 0xFFFE0000u ? 1u : 2u;
+  XELOGI("XamPushBackURI('{}'): state={}", state->dash_back_uri_,
+         state->dash_back_uri_state_);
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamPushBackURI, kNone, kImplemented);
+
+dword_result_t XamGetDashBackstackNodesCount_entry() {
+  return kernel_state()->xam_state()->dash_backstack_nodes_count_;
+}
+DECLARE_XAM_EXPORT1(XamGetDashBackstackNodesCount, kNone, kImplemented);
 
 dword_result_t XamGetDashBackstackData_entry(
     pointer_t<X_DASH_BACKSTACK_DATA> backstack_data, lpdword_t count) {

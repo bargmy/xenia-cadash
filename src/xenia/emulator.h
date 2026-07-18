@@ -10,6 +10,7 @@
 #ifndef XENIA_EMULATOR_H_
 #define XENIA_EMULATOR_H_
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -362,6 +363,7 @@ class Emulator {
   kernel::object_ref<kernel::XHostThread> plugin_loader_thread_;
   std::optional<uint32_t> title_id_;  // Currently running title ID
   std::unique_ptr<kernel::util::GameInfoDatabase> game_info_database_;
+
 
   bool paused_;
   bool restoring_;

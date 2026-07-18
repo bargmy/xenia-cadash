@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -42,6 +43,8 @@ constexpr ImVec2 default_image_icon_size = ImVec2(64.f, 64.f);
 
 class ImGuiDrawer : public WindowInputListener, public UIDrawer {
  public:
+  using FullScreenOverlay = std::function<bool(ImGuiIO&)>;
+
   ImGuiDrawer(Window* window, size_t z_order);
   ~ImGuiDrawer();
 
@@ -52,6 +55,13 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
 
   void AddNotification(ImGuiNotification* notification);
   void RemoveNotification(ImGuiNotification* notification);
+
+  // Installs a non-interactive full-screen draw callback. The callback is
+  // invoked after dialogs and notifications and must return true to remain
+  // active for the next frame. Unlike ImGuiDialog, this does not capture input
+  // or create a popup/modal window.
+  bool SetFullScreenOverlay(FullScreenOverlay overlay);
+  void ClearFullScreenOverlay();
 
   // SetPresenter may be called from the destructor.
   void SetPresenter(Presenter* new_presenter);
@@ -136,12 +146,17 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
   hid::InputSystem* input_system_ = nullptr;
 
   std::function<void(uint8_t)> onGuidePressFunction_;
+  // Guide must be edge-triggered. Without this, holding the button invokes the
+  // action once per UI frame.
+  bool guide_button_was_down_ = false;
   // All currently-attached dialogs that get drawn.
   std::vector<ImGuiDialog*> dialogs_;
 
   // All queued notifications. Notification at index 0 is currently presented
   // one.
   std::vector<ImGuiNotification*> notifications_;
+
+  FullScreenOverlay full_screen_overlay_;
   // Using an index, not an iterator, because after the erasure, the adjustment
   // must be done for the vector element indices that would be in the iterator
   // range that would be invalidated.

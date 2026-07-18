@@ -75,6 +75,14 @@ dword_result_t XamEnumerate_entry(dword_t handle, dword_t flags,
   if (!overlapped && items_returned) {
     *items_returned = dummy;
   }
+  if (kernel_state()->title_id() == kDashboardID) {
+    XELOGI(
+        "XamEnumerate(dashboard): handle={:08X}, flags={:08X}, "
+        "buffer={:08X}, length={}, items={}, overlapped={:08X}, result={:08X}",
+        handle.value(), flags.value(), buffer.guest_address(),
+        buffer_length.value(), !overlapped ? dummy : 0,
+        overlapped.guest_address(), result);
+  }
   return result;
 }
 DECLARE_XAM_EXPORT1(XamEnumerate, kNone, kImplemented);

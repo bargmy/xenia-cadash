@@ -59,11 +59,14 @@ bool GTKWindow::OpenImpl() {
   box_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
   gtk_container_add(GTK_CONTAINER(window_), box_);
 
-  // Add the main menu (even if fullscreen was requested, for the initial layout
-  // calculation).
+  const bool startup_fullscreen = IsFullscreen();
+
+  // Do not attach the menu at all for startup fullscreen. Attaching and then
+  // removing it after mapping allows a decorated/menu-bearing frame to become
+  // visible while the window manager is processing the fullscreen request.
   const auto* main_menu = dynamic_cast<const GTKMenuItem*>(GetMainMenu());
   GtkWidget* main_menu_widget = main_menu ? main_menu->handle() : nullptr;
-  if (main_menu_widget) {
+  if (main_menu_widget && !startup_fullscreen) {
     gtk_box_pack_start(GTK_BOX(box_), main_menu_widget, false, false, 0);
   }
 
@@ -97,21 +100,20 @@ bool GTKWindow::OpenImpl() {
   g_signal_connect(G_OBJECT(drawing_area_), "draw", G_CALLBACK(DrawHandler),
                    reinterpret_cast<gpointer>(this));
 
-  // Finally show all the widgets in the window, including the main menu.
+  if (startup_fullscreen) {
+    // Request both an undecorated window and fullscreen before the first map.
+    // This prevents the title bar and menu from flashing while Xenia is still
+    // initializing its presenter and transition overlay.
+    gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
+    gtk_window_fullscreen(GTK_WINDOW(window_));
+  }
+
+  // Map the window only after its initial fullscreen/decorated state is set.
   gtk_widget_show_all(window_);
 
   // Remove the size request after finishing the initial layout because it makes
   // it impossible to make the window smaller.
   gtk_widget_set_size_request(drawing_area_, -1, -1);
-
-  // After setting up the initial layout for non-fullscreen, enter fullscreen if
-  // requested.
-  if (IsFullscreen()) {
-    if (main_menu_widget) {
-      gtk_container_remove(GTK_CONTAINER(box_), main_menu_widget);
-    }
-    gtk_window_fullscreen(GTK_WINDOW(window_));
-  }
 
   // Make sure the initial state after opening is reported to the common Window
   // class no matter how GTK sends the events.
@@ -158,6 +160,7 @@ void GTKWindow::ApplyNewFullscreen() {
   BeginBatchedSizeUpdate();
 
   if (IsFullscreen()) {
+    gtk_window_set_decorated(GTK_WINDOW(window_), FALSE);
     if (main_menu_widget) {
       gtk_container_remove(GTK_CONTAINER(box_), main_menu_widget);
       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
@@ -176,6 +179,7 @@ void GTKWindow::ApplyNewFullscreen() {
     }
   } else {
     gtk_window_unfullscreen(GTK_WINDOW(window_));
+    gtk_window_set_decorated(GTK_WINDOW(window_), TRUE);
     if (destruction_receiver.IsWindowDestroyedOrClosed()) {
       if (!destruction_receiver.IsWindowDestroyed()) {
         EndBatchedSizeUpdate(destruction_receiver);
@@ -765,6 +769,13 @@ gboolean GTKWindow::DrawHandler(GtkWidget* widget, cairo_t* cr,
   if (!window || widget != window->drawing_area_) {
     return false;
   }
+
+  // Keep the GTK backing surface black before the graphics presenter has
+  // produced its first frame. OnPaint below will immediately replace it once
+  // presentation is available.
+  cairo_set_source_rgb(cr, 0.0, 0.0, 0.0);
+  cairo_paint(cr);
+
   if (window->batched_size_update_depth_) {
     window->batched_size_update_contained_draw_ = true;
   } else {

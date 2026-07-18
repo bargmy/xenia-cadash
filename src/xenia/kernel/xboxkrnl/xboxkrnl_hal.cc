@@ -57,10 +57,11 @@ DECLARE_XBOXKRNL_EXPORT3(HalSendSMCMessage, kNone, kStub, kImportant,
                          kHighFrequency);
 
 void HalOpenCloseODDTray_entry(dword_t open_close) {
-  kernel_state()->smc()->SetTrayState(open_close ? X_DVD_TRAY_STATE::CLOSED
+  const bool close_tray = open_close != 0;
+  kernel_state()->smc()->SetTrayState(close_tray ? X_DVD_TRAY_STATE::CLOSED
                                                  : X_DVD_TRAY_STATE::OPEN);
 }
-DECLARE_XBOXKRNL_EXPORT1(HalOpenCloseODDTray, kNone, kStub);
+DECLARE_XBOXKRNL_EXPORT1(HalOpenCloseODDTray, kNone, kImplemented);
 
 }  // namespace xboxkrnl
 }  // namespace kernel

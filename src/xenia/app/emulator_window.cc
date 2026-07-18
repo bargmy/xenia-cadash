@@ -9,6 +9,8 @@
 
 #include "xenia/app/emulator_window.h"
 
+#include <cstdio>
+
 #include "third_party/imgui/imgui.h"
 #include "third_party/stb/stb_image_write.h"
 #if defined(__clang__)
@@ -35,6 +37,7 @@
 #include "xenia/gpu/command_processor.h"
 #include "xenia/gpu/graphics_system.h"
 #include "xenia/hid/input_system.h"
+#include "xenia/kernel/xam/native_content.h"
 #include "xenia/kernel/xam/profile_manager.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/kernel/xam/xam_state.h"
@@ -592,6 +595,26 @@ void EmulatorWindow::DisplayConfigDialog::OnDraw(ImGuiIO& io) {
   }
 }
 
+EmulatorWindow::NativeContentDialog::NativeContentDialog(
+    ui::ImGuiDrawer* imgui_drawer, EmulatorWindow& emulator_window,
+    std::filesystem::path working_directory)
+    : ui::ImGuiDialog(imgui_drawer),
+      emulator_window_(emulator_window),
+      working_directory_(std::move(working_directory)) {
+  window_id_ = GetWindowId();
+
+  std::string suggested_name =
+      xe::path_to_utf8(working_directory_.filename());
+  if (suggested_name.empty()) {
+    suggested_name = xe::path_to_utf8(working_directory_.parent_path().filename());
+  }
+  if (suggested_name.empty()) {
+    suggested_name = "Native Game";
+  }
+  std::snprintf(display_name_.data(), display_name_.size(), "%s",
+                suggested_name.c_str());
+}
+
 void EmulatorWindow::ContentInstallDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(20, 20), ImGuiCond_FirstUseEver);
@@ -682,6 +705,88 @@ void EmulatorWindow::ContentInstallDialog::OnDraw(ImGuiIO& io) {
   ImGui::End();
 }
 
+void EmulatorWindow::NativeContentDialog::OnDraw(ImGuiIO& io) {
+  (void)io;
+  ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSize(ImVec2(620, 0), ImGuiCond_FirstUseEver);
+
+  bool dialog_open = true;
+  const std::string title =
+      fmt::format("Add Native Content###{}", window_id_);
+  if (!ImGui::Begin(title.c_str(), &dialog_open,
+                    ImGuiWindowFlags_NoCollapse |
+                        ImGuiWindowFlags_AlwaysAutoResize)) {
+    ImGui::End();
+    if (!dialog_open) {
+      Close();
+    }
+    return;
+  }
+
+  ImGui::TextUnformatted("Game location:");
+  ImGui::TextWrapped("%s", xe::path_to_utf8(working_directory_).c_str());
+  ImGui::Spacing();
+
+  ImGui::SetNextItemWidth(560.0f);
+  ImGui::InputText("Dashboard name", display_name_.data(),
+                   display_name_.size());
+  ImGui::SetNextItemWidth(560.0f);
+  ImGui::InputText("Run command", command_.data(), command_.size());
+
+  ImGui::Spacing();
+  ImGui::TextWrapped(
+      "The command runs from the selected game location. Examples: "
+      "bash game.sh, sudo bash game.sh, winrun game.exe.");
+  ImGui::TextWrapped(
+      "This is an arbitrary host command. Only add content you trust. "
+      "The command must stay running until the game closes so Xenia knows "
+      "when to restore the dashboard.");
+  ImGui::TextWrapped(
+      "Commands using sudo may need passwordless sudo or a configured "
+      "graphical askpass helper because Xbox mode has no visible terminal.");
+
+  if (!status_message_.empty()) {
+    ImGui::Spacing();
+    ImGui::TextWrapped("%s", status_message_.c_str());
+  }
+
+  ImGui::Spacing();
+  if (ImGui::Button("Add Native Content")) {
+    kernel::xam::NativeContentEntry entry;
+    std::string error;
+    if (kernel::xam::CreateNativeContentEntry(
+            emulator_window_.emulator_->content_root(), working_directory_,
+            display_name_.data(), command_.data(), &entry, &error)) {
+      if (auto* kernel_state = emulator_window_.emulator_->kernel_state()) {
+        kernel_state->BroadcastNotification(kXNotificationLiveContentInstalled,
+                                            0);
+      }
+
+      ui::ImGuiDialog::ShowMessageBox(
+          emulator_window_.imgui_drawer(), "Native Content Added",
+          fmt::format(
+              "{} was added as dashboard title {:08X}.\n\n"
+              "Open or refresh My Games to launch it.",
+              entry.display_name, entry.title_id));
+      Close();
+      ImGui::End();
+      return;
+    }
+    status_message_ = std::move(error);
+  }
+  ImGui::SameLine();
+  if (ImGui::Button("Cancel")) {
+    Close();
+    ImGui::End();
+    return;
+  }
+
+  if (!dialog_open) {
+    Close();
+  }
+  ImGui::End();
+}
+
 void EmulatorWindow::XMPConfigDialog::OnDraw(ImGuiIO& io) {
   ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_FirstUseEver);
   ImGui::SetNextWindowSize(ImVec2(20, 20), ImGuiCond_FirstUseEver);
@@ -763,6 +868,9 @@ bool EmulatorWindow::Initialize() {
     file_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "Install Content...",
                          std::bind(&EmulatorWindow::InstallContent, this)));
+    file_menu->AddChild(
+        MenuItem::Create(MenuItem::Type::kString, "Add Native Content...",
+                         std::bind(&EmulatorWindow::AddNativeContent, this)));
     zar_menu->AddChild(
         MenuItem::Create(MenuItem::Type::kString, "Create",
                          std::bind(&EmulatorWindow::CreateZarchive, this)));
@@ -927,6 +1035,13 @@ bool EmulatorWindow::Initialize() {
   window_->SetMainMenuEnabled(false);
 
   UpdateTitle();
+
+  // Apply startup fullscreen before the native window is opened. Platform
+  // implementations can then create and map the window as fullscreen from its
+  // first visible frame rather than briefly showing a decorated window first.
+  if (cvars::fullscreen) {
+    window_->SetFullscreen(true);
+  }
 
   if (!window_->Open()) {
     XELOGE("Failed to open the platform window");
@@ -1312,6 +1427,25 @@ void EmulatorWindow::InstallContent() {
 
   new ContentInstallDialog(imgui_drawer_.get(), *this,
                            content_installation_status);
+}
+
+void EmulatorWindow::AddNativeContent() {
+  auto file_picker = xe::ui::FilePicker::Create();
+  file_picker->set_mode(ui::FilePicker::Mode::kOpen);
+  file_picker->set_type(ui::FilePicker::Type::kDirectory);
+  file_picker->set_multi_selection(false);
+  file_picker->set_title("Select Native Game Location");
+
+  if (!file_picker->Show(window_.get())) {
+    return;
+  }
+
+  const auto selected_files = file_picker->selected_files();
+  if (selected_files.empty()) {
+    return;
+  }
+
+  new NativeContentDialog(imgui_drawer_.get(), *this, selected_files.front());
 }
 
 void EmulatorWindow::ExtractZarchive() {

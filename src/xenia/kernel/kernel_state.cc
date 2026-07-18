@@ -409,14 +409,37 @@ object_ref<XThread> KernelState::LaunchModule(object_ref<UserModule> module) {
     return nullptr;
   }
 
+  uint32_t start_address = module->entry_point();
+  uint32_t start_context = 0;
+
+  // bootanim.xex is a system component rather than a normal title XEX. Its
+  // executable entry point is not the routine that starts the animation. The
+  // dashboard/kernel launches export ordinal 1 (PlayBootAnimation), passing
+  // the module handle as the initial context argument.
+  if (module->name() == "bootanim" ||
+      module->name() == "$flash_bootanim") {
+    start_address = module->GetProcAddressByOrdinal(1);
+    start_context = module->hmodule_ptr();
+    XELOGI(
+        "KernelState: Launching boot animation through export ordinal 1 "
+        "(address={:08X}, context={:08X}).",
+        start_address, start_context);
+  }
+
+  if (!start_address) {
+    XELOGE("KernelState: Module '{}' has no valid launch address.",
+           module->name());
+    return nullptr;
+  }
+
   SetExecutableModule(module);
   XELOGI("KernelState: Launching module...");
 
   // Create a thread to run in.
   // We start suspended so we can run the debugger prep.
   auto thread = object_ref<XThread>(
-      new XThread(kernel_state(), module->stack_size(), 0,
-                  module->entry_point(), 0, X_CREATE_SUSPENDED, true, true));
+      new XThread(kernel_state(), module->stack_size(), 0, start_address,
+                  start_context, X_CREATE_SUSPENDED, true, true));
 
   // We know this is the 'main thread'.
   thread->set_name("Main XThread");
@@ -669,6 +692,77 @@ X_RESULT KernelState::FinishLoadingUserModule(
                          xe::countof(args));
   }
   return result;
+}
+
+void KernelState::RequestHudDiagnosticLoad(uint8_t user_index) {
+  if (!GetExecutableModule()) {
+    XELOGW(
+        "HUD diagnostic: Guide pressed by user {}, but no executable title is "
+        "running.",
+        user_index);
+    return;
+  }
+
+  bool expected = false;
+  if (!hud_diagnostic_load_requested_.compare_exchange_strong(expected, true)) {
+    XELOGI(
+        "HUD diagnostic: Guide pressed by user {}, but the HUD load has "
+        "already been requested.",
+        user_index);
+    return;
+  }
+
+  if (!dispatch_thread_running_ || !dispatch_thread_) {
+    XELOGE(
+        "HUD diagnostic: kernel dispatch thread is unavailable; cannot queue "
+        "the secondary HUD load.");
+    hud_diagnostic_load_requested_ = false;
+    return;
+  }
+
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    dispatch_queue_.push_back([this, user_index]() {
+      constexpr std::string_view kHudPath = "game:\\$flash_hud.xex";
+
+      XELOGI(
+          "HUD diagnostic: Guide rising edge received from user {}. Loading "
+          "{} as a secondary module; the current executable remains '{}'.",
+          user_index, kHudPath,
+          GetExecutableModule() ? GetExecutableModule()->name() : "<none>");
+
+      auto hud_module = LoadUserModule(kHudPath, false);
+      if (!hud_module) {
+        XELOGE("HUD diagnostic: LoadUserModule({}) failed.", kHudPath);
+        hud_diagnostic_load_requested_ = false;
+        return;
+      }
+
+      XELOGI(
+          "HUD diagnostic: module container loaded (name='{}', executable={}, "
+          "dll={}, entry={:08X}). Finishing import/module loading without "
+          "calling the entry point.",
+          hud_module->name(), hud_module->is_executable(),
+          hud_module->is_dll_module(), hud_module->entry_point());
+
+      const X_RESULT result = FinishLoadingUserModule(hud_module, false);
+      if (XFAILED(result)) {
+        XELOGE(
+            "HUD diagnostic: FinishLoadingUserModule failed with {:08X}.",
+            result);
+        hud_diagnostic_load_requested_ = false;
+        return;
+      }
+
+      XELOGI(
+          "HUD diagnostic: $flash_hud.xex is now loaded beside '{}'. Its "
+          "entry point was intentionally NOT called. Send this log so the "
+          "missing XAM imports and loader requirements can be implemented "
+          "before execution is enabled.",
+          GetExecutableModule() ? GetExecutableModule()->name() : "<none>");
+    });
+  }
+  dispatch_cond_.notify_all();
 }
 
 X_RESULT KernelState::ApplyTitleUpdate(

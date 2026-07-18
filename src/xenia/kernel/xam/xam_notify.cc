@@ -7,6 +7,7 @@
  ******************************************************************************
  */
 
+#include "xenia/base/logging.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xam/xam_private.h"
@@ -85,6 +86,11 @@ dword_result_t XNotifyGetNext_entry(dword_t handle, dword_t match_id,
   }
 
   *id_ptr = dequeued ? id : 0;
+  if (dequeued && id == 0x80040021u) {
+    XELOGI("XNotifyGetNext: dashboard launch notification 80040021 "
+           "data={:08X}",
+           param);
+  }
   // param_ptr may be null - 555307F0 Demo explicitly passes nullptr in the
   // code.
   // https://github.com/xenia-project/xenia/pull/1577

@@ -7,13 +7,18 @@
  ******************************************************************************
  */
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
 #include <thread>
 
+#include "third_party/imgui/imgui.h"
 #include "xenia/app/discord/discord_presence.h"
 #include "xenia/app/emulator_window.h"
 #include "xenia/base/assert.h"
@@ -28,6 +33,7 @@
 #include "xenia/emulator.h"
 #include "xenia/kernel/xam/xam_module.h"
 #include "xenia/ui/file_picker.h"
+#include "xenia/ui/imgui_drawer.h"
 #include "xenia/ui/window.h"
 #include "xenia/ui/window_listener.h"
 #include "xenia/ui/windowed_app.h"
@@ -135,6 +141,99 @@ DECLARE_int32(window_size_y);
 
 namespace xe {
 namespace app {
+
+namespace {
+
+constexpr char kRelaunchFadeEnvironment[] = "XENIA_XAM_FADE_IN";
+
+bool ConsumeRelaunchFadeInRequest() {
+  const char* value = std::getenv(kRelaunchFadeEnvironment);
+  const bool requested = value && std::strcmp(value, "1") == 0;
+  if (!requested) {
+    return false;
+  }
+#if XE_PLATFORM_WIN32
+  _putenv_s(kRelaunchFadeEnvironment, "");
+#else
+  unsetenv(kRelaunchFadeEnvironment);
+#endif
+  return true;
+}
+
+float RelaunchSmoothStep(float value) {
+  value = std::clamp(value, 0.0f, 1.0f);
+  return value * value * (3.0f - 2.0f * value);
+}
+
+struct RelaunchFadeInState {
+  std::atomic_bool title_started = false;
+};
+
+bool StartRelaunchFadeIn(ui::ImGuiDrawer* imgui_drawer,
+                         std::shared_ptr<RelaunchFadeInState> state) {
+  if (!imgui_drawer || !state) {
+    return false;
+  }
+
+  using Clock = std::chrono::steady_clock;
+  enum class Phase { kWaitingForTitle, kOpaqueHold, kFadeIn };
+  constexpr auto kMaximumBlackWait = std::chrono::seconds(15);
+  constexpr auto kOpaqueHold = std::chrono::milliseconds(120);
+  constexpr auto kFadeInDuration = std::chrono::milliseconds(350);
+
+  Phase phase = Phase::kWaitingForTitle;
+  Clock::time_point phase_start = Clock::now();
+  const Clock::time_point installed_at = phase_start;
+
+  return imgui_drawer->SetFullScreenOverlay(
+      [state, phase, phase_start, installed_at](ImGuiIO& io) mutable -> bool {
+        const auto now = Clock::now();
+        float alpha = 1.0f;
+
+        switch (phase) {
+          case Phase::kWaitingForTitle:
+            alpha = 1.0f;
+            if (state->title_started.load(std::memory_order_acquire)) {
+              phase = Phase::kOpaqueHold;
+              phase_start = now;
+            } else if (now - installed_at >= kMaximumBlackWait) {
+              XELOGW(
+                  "Relaunch fade-in timed out waiting for the new title; "
+                  "revealing the window.");
+              phase = Phase::kFadeIn;
+              phase_start = now;
+            }
+            break;
+          case Phase::kOpaqueHold:
+            alpha = 1.0f;
+            if (now - phase_start >= kOpaqueHold) {
+              phase = Phase::kFadeIn;
+              phase_start = now;
+            }
+            break;
+          case Phase::kFadeIn: {
+            const float progress =
+                std::chrono::duration<float>(now - phase_start).count() /
+                std::chrono::duration<float>(kFadeInDuration).count();
+            alpha = 1.0f - RelaunchSmoothStep(progress);
+            if (progress >= 1.0f) {
+              XELOGI("Relaunch fade-in complete.");
+              return false;
+            }
+            break;
+          }
+        }
+
+        const uint8_t alpha_byte = static_cast<uint8_t>(
+            std::clamp(std::lround(alpha * 255.0f), 0l, 255l));
+        ImGui::GetForegroundDrawList()->AddRectFilled(
+            ImVec2(0.0f, 0.0f), io.DisplaySize,
+            IM_COL32(0, 0, 0, alpha_byte));
+        return true;
+      });
+}
+
+}  // namespace
 
 class EmulatorApp final : public xe::ui::WindowedApp {
  public:
@@ -596,8 +695,22 @@ void EmulatorApp::EmulatorThread() {
     return;
   }
 
-  app_context().CallInUIThread(
-      [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
+  std::shared_ptr<RelaunchFadeInState> relaunch_fade_state;
+  if (ConsumeRelaunchFadeInRequest()) {
+    relaunch_fade_state = std::make_shared<RelaunchFadeInState>();
+    app_context().CallInUIThreadSynchronous([this, relaunch_fade_state]() {
+      emulator_window_->SetupGraphicsSystemPresenterPainting();
+      if (!StartRelaunchFadeIn(emulator_window_->imgui_drawer(),
+                               relaunch_fade_state)) {
+        XELOGE("Unable to install the relaunch fade-in overlay.");
+      } else {
+        XELOGI("Relaunch fade-in overlay installed.");
+      }
+    });
+  } else {
+    app_context().CallInUIThread(
+        [this]() { emulator_window_->SetupGraphicsSystemPresenterPainting(); });
+  }
 
   const auto fs = emulator_->file_system();
 
@@ -707,14 +820,21 @@ void EmulatorApp::EmulatorThread() {
         });
   }
 
-  emulator_->on_launch.AddListener([&](auto title_id, const auto& game_title) {
-    if (cvars::discord) {
-      discord::DiscordPresence::PlayingTitle(
-          game_title.empty() ? "Unknown Title" : std::string(game_title));
-    }
-    app_context().CallInUIThread([this]() { emulator_window_->UpdateTitle(); });
-    emulator_thread_event_->Set();
-  });
+  emulator_->on_launch.AddListener(
+      [&, relaunch_fade_state](auto title_id, const auto& game_title) {
+        if (relaunch_fade_state) {
+          relaunch_fade_state->title_started.store(
+              true, std::memory_order_release);
+        }
+        if (cvars::discord) {
+          discord::DiscordPresence::PlayingTitle(
+              game_title.empty() ? "Unknown Title"
+                                 : std::string(game_title));
+        }
+        app_context().CallInUIThread(
+            [this]() { emulator_window_->UpdateTitle(); });
+        emulator_thread_event_->Set();
+      });
 
   emulator_->on_shader_storage_initialization.AddListener(
       [this](bool initializing) {

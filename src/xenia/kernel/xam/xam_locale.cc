@@ -395,6 +395,38 @@ dword_result_t XamGetOnlineLanguageAndCountryString_entry(
 DECLARE_XAM_EXPORT1(XamGetOnlineLanguageAndCountryString, kLocale,
                     kImplemented);
 
+// XAM 17559 resolves the selected user's online language and country, then
+// formats the legal locale through the same language-country helper used by
+// XamGetOnlineLanguageAndCountryString. The dashboard supplies a 7-WCHAR
+// buffer, which is sufficient for values such as "en-US" plus the terminator.
+dword_result_t XamProfileGetLiveLegalLocale_entry(
+    dword_t user_index, dword_t buffer_length, lpu16string_t buffer) {
+  if (!buffer || buffer_length == 0 || buffer_length >= 0x80000000u) {
+    return X_E_INVALIDARG;
+  }
+
+  const auto user = kernel_state()->xam_state()->GetUserProfile(user_index);
+  const uint8_t language_id = static_cast<uint8_t>(
+      user ? user->GetLanguage()
+           : kernel_state()->xconfig()->ReadSetting<uint32_t>(
+                 XCONFIG_USER_CATEGORY,
+                 XCONFIG_USER_CATEGORY_ENTRIES::XCONFIG_USER_LANGUAGE));
+  const uint8_t country_id = static_cast<uint8_t>(
+      user ? user->GetCountry()
+           : kernel_state()->xconfig()->ReadSetting<uint8_t>(
+                 XCONFIG_USER_CATEGORY, XCONFIG_USER_COUNTRY));
+
+  const auto result = XamGetOnlineLanguageAndCountryString_entry(
+      language_id, country_id, buffer_length, buffer);
+  XELOGI(
+      "XamProfileGetLiveLegalLocale(user={}, language={}, country={}, "
+      "capacity={}) -> {:08X}",
+      static_cast<uint32_t>(user_index), language_id, country_id,
+      static_cast<uint32_t>(buffer_length), static_cast<uint32_t>(result));
+  return result;
+}
+DECLARE_XAM_EXPORT1(XamProfileGetLiveLegalLocale, kLocale, kImplemented);
+
 dword_result_t XamGetLocaleString_entry(dword_t id, dword_t buffer_length,
                                         lpu16string_t buffer) {
   if (buffer_length >= 0x80000000u) {

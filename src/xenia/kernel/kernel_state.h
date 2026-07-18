@@ -244,6 +244,12 @@ class KernelState {
   void UnloadUserModule(const object_ref<UserModule>& module,
                         bool call_entry = true);
 
+  // First-stage real HUD diagnostic. Queues loading of $flash_hud.xex as a
+  // secondary user module while the current title remains executable. This
+  // deliberately does not call the HUD entry point yet; the resulting module
+  // dump and unresolved-import log define the next implementation step.
+  void RequestHudDiagnosticLoad(uint8_t user_index);
+
   object_ref<KernelModule> GetKernelModule(const std::string_view name);
   template <typename T>
   object_ref<KernelModule> LoadKernelModule() {
@@ -379,6 +385,7 @@ class KernelState {
   util::NativeList dpc_list_;
   std::condition_variable_any dispatch_cond_;
   std::list<std::function<void()>> dispatch_queue_;
+  std::atomic<bool> hud_diagnostic_load_requested_{false};
 
   uint32_t ke_timestamp_bundle_ptr_ = 0;
   std::unique_ptr<xe::threading::HighResolutionTimer> timestamp_timer_;

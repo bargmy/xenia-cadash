@@ -12,6 +12,7 @@
 #include <cfloat>
 #include <cstring>
 #include <ranges>
+#include <utility>
 
 #include "third_party/imgui/imgui.h"
 #include "xenia/base/assert.h"
@@ -93,7 +94,7 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
     // a dialog's Draw function, re-registering the ImGuiDrawer may result in
     // ImGui being drawn multiple times in the current frame.
     window_->AddInputListener(this, z_order_);
-    if (presenter_) {
+    if (notifications_.empty() && !full_screen_overlay_ && presenter_) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
   }
@@ -124,7 +125,7 @@ void ImGuiDrawer::AddNotification(ImGuiNotification* dialog) {
       notifications_.cend()) {
     return;
   }
-  if (notifications_.empty()) {
+  if (notifications_.empty() && dialogs_.empty() && !full_screen_overlay_) {
     if (presenter_) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
@@ -139,6 +140,22 @@ void ImGuiDrawer::RemoveNotification(ImGuiNotification* dialog) {
     return;
   }
   notifications_.erase(it);
+  DetachIfLastWindowRemoved();
+}
+
+bool ImGuiDrawer::SetFullScreenOverlay(FullScreenOverlay overlay) {
+  if (!overlay || full_screen_overlay_) {
+    return false;
+  }
+  if (dialogs_.empty() && notifications_.empty() && presenter_) {
+    presenter_->AddUIDrawerFromUIThread(this, z_order_);
+  }
+  full_screen_overlay_ = std::move(overlay);
+  return true;
+}
+
+void ImGuiDrawer::ClearFullScreenOverlay() {
+  full_screen_overlay_ = nullptr;
   DetachIfLastWindowRemoved();
 }
 
@@ -540,18 +557,20 @@ void ImGuiDrawer::SetupFontTexture() {
 }
 
 void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
+  const bool has_draw_content =
+      !dialogs_.empty() || !notifications_.empty() || full_screen_overlay_;
   if (presenter_) {
     if (presenter_ == new_presenter) {
       return;
     }
-    if (!dialogs_.empty()) {
+    if (has_draw_content) {
       presenter_->RemoveUIDrawerFromUIThread(this);
     }
     ImGuiIO& io = GetIO();
   }
   presenter_ = new_presenter;
   if (presenter_) {
-    if (!dialogs_.empty()) {
+    if (has_draw_content) {
       presenter_->AddUIDrawerFromUIThread(this, z_order_);
     }
   }
@@ -595,7 +614,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     return;
   }
 
-  if (dialogs_.empty() && notifications_.empty()) {
+  if (dialogs_.empty() && notifications_.empty() &&
+      !full_screen_overlay_) {
     return;
   }
 
@@ -657,6 +677,10 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
     }
   }
 
+  if (full_screen_overlay_ && !full_screen_overlay_(io)) {
+    full_screen_overlay_ = nullptr;
+  }
+
   ImGui::Render();
   ImDrawData* draw_data = ImGui::GetDrawData();
   if (draw_data) {
@@ -672,7 +696,8 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   // it now if needed.
   DetachIfLastWindowRemoved();
 
-  if (!dialogs_.empty() || !notifications_.empty()) {
+  if (!dialogs_.empty() || !notifications_.empty() ||
+      full_screen_overlay_) {
     // Repaint (and handle input) continuously if still active.
     presenter_->RequestUIPaintFromUIThread();
   }
@@ -909,7 +934,8 @@ void ImGuiDrawer::DetachIfLastWindowRemoved() {
   // only dialog, then adding a dialog, from within a dialog's Draw function,
   // re-registering the ImGuiDrawer may result in ImGui being drawn multiple
   // times in the current frame.
-  if (!dialogs_.empty() || !notifications_.empty() || IsDrawingDialogs()) {
+  if (!dialogs_.empty() || !notifications_.empty() || full_screen_overlay_ ||
+      IsDrawingDialogs()) {
     return;
   }
   if (presenter_) {
@@ -964,6 +990,7 @@ void ImGuiDrawer::UpdateGamepads() {
     }
   }
   if (controller_to_poke == XUserIndexNone) {
+    guide_button_was_down_ = false;
     io.ClearInputKeys();
     return;
   }
@@ -971,13 +998,17 @@ void ImGuiDrawer::UpdateGamepads() {
   io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
   hid::X_INPUT_GAMEPAD& gamepad = gamepad_state.gamepad;
 
-  // GUIDE BUTTON - More info needed
-  if (gamepad_state.gamepad.buttons ==
-      hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_GUIDE) {
-    if (onGuidePressFunction_) {
-      onGuidePressFunction_(controller_to_poke);
-    }
+  // Invoke the Guide action only on the released -> pressed transition. The
+  // Guide bit may be combined with other buttons, so test the bit rather than
+  // requiring it to be the entire button mask.
+  const bool guide_button_is_down =
+      (gamepad.buttons &
+       hid::X_INPUT_GAMEPAD_BUTTON::X_INPUT_GAMEPAD_GUIDE) != 0;
+  if (guide_button_is_down && !guide_button_was_down_ &&
+      onGuidePressFunction_) {
+    onGuidePressFunction_(controller_to_poke);
   }
+  guide_button_was_down_ = guide_button_is_down;
 
 #define IM_SATURATE(V) (V < 0.0f ? 0.0f : V > 1.0f ? 1.0f : V)
 #define MAP_BUTTON(KEY_NO, BUTTON_ENUM)                           \

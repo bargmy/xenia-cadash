@@ -199,6 +199,13 @@ dword_result_t XamContentCreateDeviceEnumerator_entry(dword_t content_type,
   }
 
   *handle_out = e->handle();
+  if (kernel_state()->title_id() == kDashboardID) {
+    XELOGI(
+        "XamContentCreateDeviceEnumerator(dashboard): type={:08X}, "
+        "flags={:08X}, max={}, items={}, handle={:08X}",
+        content_type.value(), content_flags.value(), max_count.value(),
+        e->item_count(), e->handle());
+  }
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamContentCreateDeviceEnumerator, kNone, kImplemented);

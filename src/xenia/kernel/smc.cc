@@ -16,7 +16,7 @@ namespace xe {
 namespace kernel {
 
 SystemManagementController::SystemManagementController()
-    : dvd_tray_state_(X_DVD_TRAY_STATE::OPEN) {
+    : dvd_tray_state_(X_DVD_TRAY_STATE::CLOSED) {
   auto registerQuery =
       [&](X_SMC_CMD command,
           void (SystemManagementController::*fn)(X_SMC_DATA*, X_SMC_DATA*)) {
@@ -154,8 +154,22 @@ void SystemManagementController::SetIRAddress(X_SMC_DATA* smc_message,
 
 void SystemManagementController::SetDriveTray(X_SMC_DATA* smc_message,
                                               X_SMC_DATA* smc_response) {
-  SetTrayState(
-      static_cast<X_DVD_TRAY_STATE>((smc_message->smc_data[0] & 0xF) % 5));
+  const X_DVD_TRAY_STATE requested_state = static_cast<X_DVD_TRAY_STATE>(
+      (smc_message->smc_data[0] & 0xF) % 5);
+
+  // The DVD tray is fully virtual. A guest can open and close it and receives
+  // the normal tray-state notification, but no host optical device is touched
+  // or scanned. Collapse transitional requests to their final stable state so
+  // the dashboard immediately updates its Open Tray / Close Tray action.
+  if (requested_state == X_DVD_TRAY_STATE::OPEN ||
+      requested_state == X_DVD_TRAY_STATE::OPENING) {
+    SetTrayState(X_DVD_TRAY_STATE::OPEN);
+  } else if (requested_state == X_DVD_TRAY_STATE::CLOSED ||
+             requested_state == X_DVD_TRAY_STATE::CLOSING) {
+    SetTrayState(X_DVD_TRAY_STATE::CLOSED);
+  } else {
+    SetTrayState(requested_state);
+  }
 }
 
 void SystemManagementController::SetFanSpeed(X_SMC_DATA* smc_message,

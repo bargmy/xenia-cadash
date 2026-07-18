@@ -7,7 +7,17 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <fstream>
 #include <ranges>
+#include <regex>
+#include <sstream>
+#include <system_error>
+
+#include "xenia/base/platform.h"
 
 #include "xenia/emulator.h"
 
@@ -308,6 +318,15 @@ X_STATUS Emulator::Setup(
   XELOGI("{}: Initializing Kernel...", __func__);
   // Shared kernel state.
   kernel_state_ = std::make_unique<xe::kernel::KernelState>(this);
+
+  // First-stage authentic HUD diagnostic: a Guide-button rising edge queues
+  // $flash_hud.xex as a secondary module without replacing the dashboard/game
+  // and without executing the HUD entry point yet.
+  imgui_drawer_->SetGuideButtonAction([this](uint8_t user_index) {
+    if (kernel_state_) {
+      kernel_state_->RequestHudDiagnosticLoad(user_index);
+    }
+  });
 #define LOAD_KERNEL_MODULE(t) \
   static_cast<void>(kernel_state_->LoadKernelModule<kernel::t>())
   // HLE kernel modules.
@@ -353,9 +372,11 @@ X_STATUS Emulator::TerminateTitle() {
   }
 
   kernel_state_->TerminateTitle();
+  main_thread_.reset();
   title_id_ = std::nullopt;
   title_name_ = "";
   title_version_ = "";
+  game_info_database_.reset();
   on_terminate();
   return X_STATUS_SUCCESS;
 }
@@ -1724,10 +1745,14 @@ X_STATUS Emulator::CompleteLaunch(const std::filesystem::path& path,
     }
   }
 
-  // Resume the main thread now.
-  // If the debugger has requested a suspend this will just decrement the
-  // suspend count without resuming it until the debugger wants.
-  main_thread_->Resume();
+  // Resume the main thread now unless a host-side title transition currently
+  // owns the emulator pause. In that case Emulator::Resume will start the new
+  // title only after the old title has been completely torn down.
+  if (!is_paused()) {
+    // If the debugger has requested a suspend this will just decrement the
+    // suspend count without resuming it until the debugger wants.
+    main_thread_->Resume();
+  }
 
   return X_STATUS_SUCCESS;
 }

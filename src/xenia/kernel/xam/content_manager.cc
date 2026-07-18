@@ -9,12 +9,17 @@
 
 #include "xenia/kernel/xam/content_manager.h"
 
+#include <algorithm>
+#include <iterator>
+#include <regex>
+
 #include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/filesystem.h"
 #include "xenia/base/logging.h"
 #include "xenia/base/string.h"
 #include "xenia/emulator.h"
 #include "xenia/kernel/kernel_state.h"
+#include "xenia/kernel/xam/native_content.h"
 #include "xenia/kernel/xam/user_profile.h"
 #include "xenia/kernel/xfile.h"
 #include "xenia/kernel/xobject.h"
@@ -105,6 +110,10 @@ std::filesystem::path ContentManager::ResolvePackagePath(
     uint64_t used_xuid =
         (data.xuid != -1 && data.xuid != 0) ? data.xuid.get() : xuid;
 
+    if (IsNativeContentTitleId(title_id)) {
+      used_xuid = 0;
+    }
+
     // All DLCs are stored in common directory, so we need to override xuid for
     // them and probably some other types.
     if (data.content_type == XContentType::kMarketplaceContent) {
@@ -145,6 +154,10 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(
     const XContentType content_type) const {
   if (title_id == kCurrentlyRunningTitleId) {
     title_id = kernel_state_->title_id();
+  }
+
+  if (IsNativeContentTitleId(title_id)) {
+    xuid = 0;
   }
 
   if (content_type == XContentType::kMarketplaceContent) {
@@ -203,6 +216,18 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
     const XContentType content_type) const {
   std::vector<XCONTENT_AGGREGATE_DATA> result;
 
+  if (content_type == XContentType::kFolder) {
+    // XAM aggregate callers use 0xFFFFFFFF as an all-content-types wildcard.
+    for (XContentType enumerated_type : FindContentTypes(xuid, title_id)) {
+      auto typed_content =
+          ListContent(device_id, xuid, title_id, enumerated_type);
+      result.insert(result.end(),
+                    std::make_move_iterator(typed_content.begin()),
+                    std::make_move_iterator(typed_content.end()));
+    }
+    return result;
+  }
+
   std::unordered_set<uint32_t> title_ids = {title_id};
 
   if (content_type == XContentType::kPublisher) {
@@ -237,6 +262,84 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(
       }
     }
   }
+  return result;
+}
+
+std::vector<uint32_t> ContentManager::FindTitleIds(uint64_t xuid) const {
+  static const std::regex kTitleIdPattern("^[0-9A-Fa-f]{8}$");
+
+  std::vector<uint32_t> title_ids;
+  const auto xuid_root = root_path_ / fmt::format("{:016X}", xuid);
+
+  for (const auto& entry : xe::filesystem::ListDirectories(xuid_root)) {
+    const std::string name = xe::path_to_utf8(entry.name);
+    if (!std::regex_match(name, kTitleIdPattern)) {
+      continue;
+    }
+
+    title_ids.push_back(
+        xe::string_util::from_string<uint32_t>(name, true));
+  }
+
+  std::sort(title_ids.begin(), title_ids.end());
+  title_ids.erase(std::unique(title_ids.begin(), title_ids.end()),
+                  title_ids.end());
+  return title_ids;
+}
+
+std::vector<XContentType> ContentManager::FindContentTypes(
+    uint64_t xuid, uint32_t title_id) const {
+  static const std::regex kContentTypePattern("^[0-9A-Fa-f]{8}$");
+
+  std::vector<XContentType> content_types;
+  const auto title_root = root_path_ / fmt::format("{:016X}", xuid) /
+                          fmt::format("{:08X}", title_id);
+
+  for (const auto& entry : xe::filesystem::ListDirectories(title_root)) {
+    const std::string name = xe::path_to_utf8(entry.name);
+    if (!std::regex_match(name, kContentTypePattern)) {
+      // In particular, skip the synthetic "Headers" directory.
+      continue;
+    }
+
+    content_types.push_back(static_cast<XContentType>(
+        xe::string_util::from_string<uint32_t>(name, true)));
+  }
+
+  std::sort(content_types.begin(), content_types.end(),
+            [](XContentType a, XContentType b) {
+              return static_cast<uint32_t>(a) < static_cast<uint32_t>(b);
+            });
+  content_types.erase(std::unique(content_types.begin(), content_types.end()),
+                      content_types.end());
+  return content_types;
+}
+
+std::vector<XCONTENT_AGGREGATE_DATA>
+ContentManager::ListContentAcrossTitles(uint32_t device_id, uint64_t xuid,
+                                        XContentType content_type) const {
+  std::vector<XCONTENT_AGGREGATE_DATA> result;
+
+  for (uint32_t title_id : FindTitleIds(xuid)) {
+    auto title_content = ListContent(device_id, xuid, title_id, content_type);
+    result.insert(result.end(),
+                  std::make_move_iterator(title_content.begin()),
+                  std::make_move_iterator(title_content.end()));
+  }
+
+  std::sort(result.begin(), result.end(),
+            [](const XCONTENT_AGGREGATE_DATA& a,
+               const XCONTENT_AGGREGATE_DATA& b) {
+              if (a.title_id.get() != b.title_id.get()) {
+                return a.title_id.get() < b.title_id.get();
+              }
+              if (a.content_type != b.content_type) {
+                return static_cast<uint32_t>(a.content_type.get()) <
+                       static_cast<uint32_t>(b.content_type.get());
+              }
+              return a.file_name() < b.file_name();
+            });
+  result.erase(std::unique(result.begin(), result.end()), result.end());
   return result;
 }
 

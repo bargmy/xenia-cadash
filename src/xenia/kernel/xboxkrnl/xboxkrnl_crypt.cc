@@ -1128,6 +1128,19 @@ dword_result_t XeKeysHmacShaUsingKey_entry(lpvoid_t obscured_key,
 }
 DECLARE_XBOXKRNL_EXPORT1(XeKeysHmacShaUsingKey, kNone, kImplemented);
 
+dword_result_t XeKeysGetMediaID_entry(lpvoid_t media_id_out,
+                                      dword_t media_index) {
+  if (!media_id_out || media_index != 1) {
+    return X_STATUS_INVALID_PARAMETER;
+  }
+
+  // Physical optical-media probing is disabled. Keep the API deterministic
+  // and report that no host disc identity is available.
+  std::memset(media_id_out.as<void*>(), 0, 16);
+  return X_STATUS_UNSUCCESSFUL;
+}
+DECLARE_XBOXKRNL_EXPORT1(XeKeysGetMediaID, kNone, kImplemented);
+
 dword_result_t XeKeysGetConsoleType_entry(lpdword_t type_out) {
   *type_out = Retail;
   return 0;

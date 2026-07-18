@@ -10,7 +10,11 @@
 #ifndef XENIA_KERNEL_XAM_XAM_MODULE_H_
 #define XENIA_KERNEL_XAM_XAM_MODULE_H_
 
+#include <cstdint>
+#include <filesystem>
 #include <string>
+#include <string_view>
+#include <vector>
 
 #include "xenia/cpu/export_resolver.h"
 #include "xenia/kernel/kernel_module.h"
@@ -19,6 +23,8 @@
 namespace xe {
 namespace kernel {
 namespace xam {
+
+struct NativeContentEntry;
 
 static constexpr std::string_view kXamModuleLoaderDataFileName =
     "launch_data.bin";
@@ -42,10 +48,22 @@ class XamModule : public KernelModule {
   void LoadLoaderData();
   void SaveLoaderData();
 
+  // Persists the requested title handoff, fades the existing window fully to
+  // black, and then replaces the current Xenia process image. The relaunched
+  // emulator boots the next title with a clean kernel, GPU and audio state and
+  // fades the new title back in after it reports a successful launch.
+  bool RequestTitleLaunch(const std::filesystem::path& host_path,
+                          std::string_view launch_path, uint32_t launch_flags);
+
+  // Boots dash.xex from the folder containing the Xenia executable.
+  bool RequestDashboardLaunch(uint32_t launch_flags = 0);
+
   const LoaderData& loader_data() const { return loader_data_; }
   LoaderData& loader_data() { return loader_data_; }
 
  private:
+  bool RequestNativeContentLaunch(const NativeContentEntry& entry);
+
   LoaderData loader_data_;
 };
 

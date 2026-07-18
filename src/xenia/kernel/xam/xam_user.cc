@@ -88,6 +88,138 @@ dword_result_t XamUserGetIndexFromXUID_entry(qword_t xuid, dword_t flags,
 }
 DECLARE_XAM_EXPORT1(XamUserGetIndexFromXUID, kUserProfiles, kImplemented);
 
+// XAM 17559 initializes a supplied XAM_OVERLAPPED to IO_PENDING, queues its
+// internal logon task and completes the overlapped when the queue is drained.
+// Xenia has no pending Live logon work, so queue a successful completion while
+// preserving the asynchronous API contract observed by the dashboard.
+dword_result_t XamUserFlushLogonQueue_entry(
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  if (!overlapped_ptr) {
+    XELOGI("XamUserFlushLogonQueue(NULL) -> SUCCESS");
+    return X_ERROR_SUCCESS;
+  }
+
+  XELOGI("XamUserFlushLogonQueue(overlapped={:08X}) -> SUCCESS (queued)",
+         overlapped_ptr.guest_address());
+  kernel_state()->CompleteOverlappedDeferredEx(
+      [](uint32_t& extended_error, uint32_t& length) -> X_RESULT {
+        extended_error = X_ERROR_SUCCESS;
+        length = 0;
+        return X_ERROR_SUCCESS;
+      },
+      overlapped_ptr.guest_address());
+
+  // Retail 17559 leaves the XAM_OVERLAPPED result as IO_PENDING while the
+  // task is queued, but the function itself returns success.
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamUserFlushLogonQueue, kUserProfiles, kImplemented);
+
+// Retail wrapper xam!816B1F68 dispatches app FB message 000B0082 with
+// {user_index, preference_mask, output_pointer}. When an overlapped pointer is
+// supplied, it returns Win32 ERROR_IO_PENDING (997); the Metro dashboard's
+// Content App explicitly checks for 997 before installing its completion
+// callback. Returning synchronous success skips that callback and prevents the
+// library model from reaching XamContentAggregateCreateEnumerator.
+dword_result_t XamUserReadUserPreference_entry(
+    dword_t user_index, dword_t preference, lpdword_t value_ptr,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  const uint32_t user = user_index.value();
+  const uint32_t mask = preference.value();
+
+  // Retail xam!816B1F68 validates only the user index and output
+  // pointer before dispatching app FB message 0x000B0082.
+  if (user >= XUserMaxUserCount || !value_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto run = [user, mask, value_ptr](uint32_t& extended_error,
+                                     uint32_t& length) -> X_RESULT {
+    auto xam_state = kernel_state()->xam_state();
+    if (!xam_state->IsUserSignedIn(user)) {
+      *value_ptr = 0;
+      extended_error = X_HRESULT_FROM_WIN32(X_ERROR_NO_SUCH_USER);
+      length = 0;
+      return X_ERROR_NO_SUCH_USER;
+    }
+
+    const uint32_t value = xam_state->user_preference_flags_[user] & mask;
+    *value_ptr = value;
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
+    length = 0;
+    XELOGI(
+        "XamUserReadUserPreference complete(user={}, mask={:08X}, "
+        "value={:08X})",
+        user, mask, value);
+    return X_ERROR_SUCCESS;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error = 0;
+    uint32_t length = 0;
+    return run(extended_error, length);
+  }
+
+  XELOGI(
+      "XamUserReadUserPreference(user={}, mask={:08X}, out={:08X}, "
+      "overlapped={:08X}) -> IO_PENDING",
+      user, mask, value_ptr.guest_address(), overlapped_ptr.guest_address());
+  kernel_state()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+  return X_ERROR_IO_PENDING;
+}
+DECLARE_XAM_EXPORT1(XamUserReadUserPreference, kUserProfiles, kImplemented);
+
+// Retail companion wrapper xam!816B2018 dispatches app FB message 000B0083
+// with {user_index, preference_mask, value}. Keep the same asynchronous
+// contract so Content App can update the bit after its read callback.
+dword_result_t XamUserWriteUserPreference_entry(
+    dword_t user_index, dword_t preference, dword_t value,
+    pointer_t<XAM_OVERLAPPED> overlapped_ptr) {
+  const uint32_t user = user_index.value();
+  const uint32_t mask = preference.value();
+  const uint32_t requested_value = value.value();
+
+  // Retail xam!816B2018 validates the user index before dispatching
+  // app FB message 0x000B0083.
+  if (user >= XUserMaxUserCount) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  auto run = [user, mask, requested_value](uint32_t& extended_error,
+                                           uint32_t& length) -> X_RESULT {
+    auto xam_state = kernel_state()->xam_state();
+    if (!xam_state->IsUserSignedIn(user)) {
+      extended_error = X_HRESULT_FROM_WIN32(X_ERROR_NO_SUCH_USER);
+      length = 0;
+      return X_ERROR_NO_SUCH_USER;
+    }
+
+    uint32_t& flags = xam_state->user_preference_flags_[user];
+    flags = (flags & ~mask) | (requested_value & mask);
+    extended_error = X_HRESULT_FROM_WIN32(X_ERROR_SUCCESS);
+    length = 0;
+    XELOGI(
+        "XamUserWriteUserPreference complete(user={}, mask={:08X}, "
+        "value={:08X}, flags={:08X})",
+        user, mask, requested_value, flags);
+    return X_ERROR_SUCCESS;
+  };
+
+  if (!overlapped_ptr) {
+    uint32_t extended_error = 0;
+    uint32_t length = 0;
+    return run(extended_error, length);
+  }
+
+  XELOGI(
+      "XamUserWriteUserPreference(user={}, mask={:08X}, value={:08X}, "
+      "overlapped={:08X}) -> IO_PENDING",
+      user, mask, requested_value, overlapped_ptr.guest_address());
+  kernel_state()->CompleteOverlappedDeferredEx(run, overlapped_ptr);
+  return X_ERROR_IO_PENDING;
+}
+DECLARE_XAM_EXPORT1(XamUserWriteUserPreference, kUserProfiles, kImplemented);
+
 dword_result_t XamUserGetSigninState_entry(dword_t user_index) {
   uint32_t signin_state = 0;
   if (user_index >= XUserMaxUserCount) {

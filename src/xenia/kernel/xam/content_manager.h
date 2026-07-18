@@ -227,6 +227,11 @@ class ContentManager {
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
 
+  // Enumerates content below every valid 8-hex-digit title directory for an
+  // XUID. XContentType::kFolder (0xFFFFFFFF) is treated as a wildcard.
+  std::vector<XCONTENT_AGGREGATE_DATA> ListContentAcrossTitles(
+      uint32_t device_id, uint64_t xuid, XContentType content_type) const;
+
   std::vector<XCONTENT_AGGREGATE_DATA> ListContentODD(
       const uint32_t device_id, const uint64_t xuid, const uint32_t title_id,
       const XContentType content_type) const;
@@ -274,6 +279,10 @@ class ContentManager {
   std::filesystem::path ResolvePackageHeaderPath(
       const std::string_view file_name, uint64_t xuid, uint32_t title_id,
       const XContentType content_type) const;
+
+  std::vector<uint32_t> FindTitleIds(uint64_t xuid) const;
+  std::vector<XContentType> FindContentTypes(uint64_t xuid,
+                                             uint32_t title_id) const;
 
   std::unordered_set<uint32_t> FindPublisherTitleIds(
       const uint64_t xuid,
